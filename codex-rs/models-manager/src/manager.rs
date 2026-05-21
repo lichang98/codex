@@ -31,8 +31,24 @@ const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// this endpoint only when it decides a remote refresh should happen.
 #[async_trait]
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Stable provider identifier used to scope the on-disk models cache so
+    /// switching providers does not reuse another provider's catalog.
+    fn provider_id(&self) -> String;
+
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
+
+    /// Returns whether the provider can authenticate `/models` requests on its
+    /// own — without relying on the managed OpenAI auth manager. This includes
+    /// explicit bearer sources (`env_key`, `experimental_bearer_token`),
+    /// header-based auth (`http_headers` / `env_http_headers`), and providers
+    /// that simply do not require OpenAI auth at all (e.g. local OSS servers).
+    ///
+    /// Defaults to `false`; implementors should override when their provider
+    /// has any non-managed auth path so the models refresh fires.
+    fn has_self_provided_auth(&self) -> bool {
+        false
+    }
 
     /// Returns whether the currently resolved auth can use Codex backend-only models.
     async fn uses_codex_backend(&self) -> bool;
@@ -302,17 +318,20 @@ impl OpenAiModelsManager {
 
     async fn fetch_and_update_models(&self) -> CoreResult<()> {
         let client_version = crate::client_version_to_whole();
+        let provider_id = self.endpoint_client.provider_id();
         let (models, etag) = self.endpoint_client.list_models(&client_version).await?;
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
         self.cache_manager
-            .persist_cache(&models, etag, client_version)
+            .persist_cache(&models, etag, client_version, provider_id)
             .await;
         Ok(())
     }
 
     async fn should_refresh_models(&self) -> bool {
-        self.endpoint_client.uses_codex_backend().await || self.endpoint_client.has_command_auth()
+        self.endpoint_client.uses_codex_backend().await
+            || self.endpoint_client.has_command_auth()
+            || self.endpoint_client.has_self_provided_auth()
     }
 
     async fn get_etag(&self) -> Option<String> {
@@ -357,10 +376,16 @@ impl OpenAiModelsManager {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
-        info!(client_version, "models cache: evaluating cache eligibility");
-        // TODO(celia-oai): Include provider identity in cache eligibility so switching
-        // providers does not reuse a fresh models_cache.json entry from another provider.
-        let cache = match self.cache_manager.load_fresh(&client_version).await {
+        let provider_id = self.endpoint_client.provider_id();
+        info!(
+            client_version,
+            provider_id, "models cache: evaluating cache eligibility"
+        );
+        let cache = match self
+            .cache_manager
+            .load_fresh(&client_version, &provider_id)
+            .await
+        {
             Some(cache) => cache,
             None => {
                 info!("models cache: no usable cache entry");

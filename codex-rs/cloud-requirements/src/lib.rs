@@ -340,7 +340,13 @@ impl CloudRequirementsService {
     }
 
     async fn fetch(&self) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        // Use the cached auth for the eligibility gate so startup never
+        // blocks on a slow `auth.openai.com` proactive refresh — that round
+        // trip only makes sense if we actually need to call the ChatGPT
+        // backend, which we don't until we get past the eligibility check
+        // and (potentially) miss the local cache. If the backend call later
+        // returns 401, `auth_recovery` will refresh on demand.
+        let Some(auth) = self.auth_manager.auth_no_refresh().await else {
             return Ok(None);
         };
         if !cloud_requirements_eligible_auth(&auth) {
@@ -557,7 +563,10 @@ impl CloudRequirementsService {
     }
 
     async fn refresh_cache(&self) -> bool {
-        let Some(auth) = self.auth_manager.auth().await else {
+        // Same rationale as `fetch()`: use cached auth for the eligibility
+        // gate; the on-demand refresh on 401 inside `fetch_with_retries`
+        // handles the genuinely-stale-token case.
+        let Some(auth) = self.auth_manager.auth_no_refresh().await else {
             return false;
         };
         if !cloud_requirements_eligible_auth(&auth) {

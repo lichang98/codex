@@ -617,7 +617,12 @@ impl Session {
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
         let auth_and_mcp_fut = async move {
-            let auth = auth_manager_clone.auth().await;
+            // Session init only needs the cached auth view for MCP server
+            // selection and OAuth-status display; we don't issue a Codex
+            // backend request here. Skip the proactive refresh so session
+            // start does not block on `auth.openai.com` for users with a
+            // stale `~/.codex/auth.json`.
+            let auth = auth_manager_clone.auth_no_refresh().await;
             let mcp_servers = mcp_manager_for_mcp
                 .effective_servers(&config_for_mcp, auth.as_ref())
                 .await;

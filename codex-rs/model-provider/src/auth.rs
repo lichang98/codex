@@ -62,17 +62,26 @@ pub fn unauthenticated_auth_provider() -> SharedAuthProvider {
     Arc::new(UnauthenticatedAuthProvider)
 }
 
-/// Returns the provider-scoped auth manager when this provider uses command-backed auth.
+/// Returns the provider-scoped auth manager.
 ///
-/// Providers without custom auth continue using the caller-supplied base manager, when present.
+/// - Providers with a command-backed `auth` block always get an
+///   `external_bearer_only` manager.
+/// - Providers that do not require OpenAI auth (`requires_openai_auth = false`)
+///   never inherit the caller-supplied managed `AuthManager`. This keeps a
+///   stale `~/.codex/auth.json` from triggering proactive ChatGPT token
+///   refreshes against `auth.openai.com` on every turn.
+/// - All other providers continue to use the caller-supplied base manager.
 pub(crate) fn auth_manager_for_provider(
     auth_manager: Option<Arc<AuthManager>>,
     provider: &ModelProviderInfo,
 ) -> Option<Arc<AuthManager>> {
-    match provider.auth.clone() {
-        Some(config) => Some(AuthManager::external_bearer_only(config)),
-        None => auth_manager,
+    if let Some(config) = provider.auth.clone() {
+        return Some(AuthManager::external_bearer_only(config));
     }
+    if !provider.requires_openai_auth {
+        return None;
+    }
+    auth_manager
 }
 
 pub(crate) fn resolve_provider_auth(

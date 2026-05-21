@@ -1309,3 +1309,49 @@ async fn missing_plan_type_maps_to_unknown() {
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_no_refresh_skips_proactive_refresh_for_stale_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let _refresh_guard = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+
+    let codex_home = tempdir().unwrap();
+    let stale_auth_dot_json = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: IdTokenInfo::default(),
+            access_token: "stale-access".to_string(),
+            refresh_token: "stale-refresh".to_string(),
+            account_id: Some("acct-1".to_string()),
+        }),
+        last_refresh: Some(Utc::now() - chrono::Duration::days(30)),
+        agent_identity: None,
+    };
+    let auth = CodexAuth::from_auth_dot_json(
+        codex_home.path(),
+        stale_auth_dot_json,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("stale auth should construct");
+
+    let manager = AuthManager::from_auth_for_testing(auth);
+    let resolved = manager
+        .auth_no_refresh()
+        .await
+        .expect("auth should resolve");
+    assert!(matches!(resolved, CodexAuth::Chatgpt(_)));
+    server.verify().await;
+}

@@ -146,6 +146,10 @@ impl ExternalAuth for TestUnresolvedExternalApiKeyAuth {
 
 #[async_trait]
 impl ModelsEndpointClient for TestModelsEndpoint {
+    fn provider_id(&self) -> String {
+        "test-models-endpoint".to_string()
+    }
+
     fn has_command_auth(&self) -> bool {
         self.has_command_auth
     }
@@ -615,6 +619,88 @@ async fn refresh_available_models_refetches_when_version_mismatch() {
 }
 
 #[tokio::test]
+async fn refresh_available_models_refetches_when_provider_mismatch() {
+    let initial_models = vec![remote_model(
+        "provider-a-model",
+        "Provider A",
+        /*priority*/ 1,
+    )];
+    let codex_home = tempdir().expect("temp dir");
+    let updated_models = vec![remote_model(
+        "provider-b-model",
+        "Provider B",
+        /*priority*/ 2,
+    )];
+    let endpoint = TestModelsEndpoint::new(vec![initial_models.clone(), updated_models.clone()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("initial refresh succeeds");
+
+    // Simulate the user switching to a different provider that happens to share
+    // the same `codex_home` (and therefore the same `models_cache.json`). The
+    // cache entry was written by the original provider; on the next refresh,
+    // the cache must be treated as a miss instead of serving Provider A's
+    // catalog as Provider B's defaults.
+    manager
+        .cache_manager
+        .mutate_cache_for_test(|cache| {
+            cache.provider_id = Some("a-different-provider".to_string());
+        })
+        .await
+        .expect("cache mutation succeeds");
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("second refresh succeeds");
+    assert_models_contain(&manager.get_remote_models().await, &updated_models);
+    assert_eq!(
+        endpoint.fetch_count(),
+        2,
+        "provider mismatch should fetch models again"
+    );
+}
+
+#[tokio::test]
+async fn refresh_available_models_refetches_when_cached_provider_id_missing() {
+    // Caches written before the provider_id field existed have a `None`
+    // value after deserialization. Treat that as a mismatch so we never reuse
+    // an unscoped cache entry across provider switches.
+    let initial_models = vec![remote_model("pre-upgrade", "Pre", /*priority*/ 1)];
+    let codex_home = tempdir().expect("temp dir");
+    let updated_models = vec![remote_model("post-upgrade", "Post", /*priority*/ 2)];
+    let endpoint = TestModelsEndpoint::new(vec![initial_models.clone(), updated_models.clone()]);
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("initial refresh succeeds");
+
+    manager
+        .cache_manager
+        .mutate_cache_for_test(|cache| {
+            cache.provider_id = None;
+        })
+        .await
+        .expect("cache mutation succeeds");
+
+    manager
+        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("second refresh succeeds");
+    assert_models_contain(&manager.get_remote_models().await, &updated_models);
+    assert_eq!(
+        endpoint.fetch_count(),
+        2,
+        "missing cached provider_id should fetch models again"
+    );
+}
+
+#[tokio::test]
 async fn refresh_available_models_drops_removed_remote_models() {
     let initial_models = vec![remote_model(
         "remote-old",
@@ -715,6 +801,10 @@ impl TestAuthAwareModelsEndpoint {
 
 #[async_trait]
 impl ModelsEndpointClient for TestAuthAwareModelsEndpoint {
+    fn provider_id(&self) -> String {
+        "test-auth-aware-models-endpoint".to_string()
+    }
+
     fn has_command_auth(&self) -> bool {
         false
     }

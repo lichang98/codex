@@ -1423,6 +1423,22 @@ impl AuthManager {
         self.auth_cached()
     }
 
+    /// Returns the cached auth snapshot without performing a proactive ChatGPT
+    /// token refresh. Use this for callers that only need a metadata view of
+    /// the current auth — e.g. account-id lookups, telemetry tagging, or
+    /// passing auth as a cache key — and that will not themselves issue a
+    /// Codex/ChatGPT backend request with the returned token.
+    ///
+    /// Callers that are about to send a request to a Codex/ChatGPT backend
+    /// (and therefore need a live access token) should keep using `auth()`
+    /// so a stale token is refreshed proactively.
+    pub async fn auth_no_refresh(&self) -> Option<CodexAuth> {
+        if let Some(auth) = self.resolve_external_api_key_auth().await {
+            return Some(auth);
+        }
+        self.auth_cached()
+    }
+
     /// Force a reload of the auth information from auth.json. Returns
     /// whether the auth value changed.
     pub async fn reload(&self) -> bool {

@@ -67,8 +67,31 @@ impl OpenAiModelsEndpoint {
 
 #[async_trait]
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn provider_id(&self) -> String {
+        provider_config_fingerprint(&self.provider_info)
+    }
+
     fn has_command_auth(&self) -> bool {
         self.provider_info.has_command_auth()
+    }
+
+    fn has_self_provided_auth(&self) -> bool {
+        // Explicit bearer source. `api_key()` (rather than `env_key.is_some()`)
+        // so providers that declare `env_key` without the variable being set
+        // don't claim to have auth.
+        if self.provider_info.api_key().ok().flatten().is_some()
+            || self.provider_info.experimental_bearer_token.is_some()
+        {
+            return true;
+        }
+        // Non-OpenAI providers (`requires_openai_auth = false`) handle their
+        // own auth via whatever mechanism the user configured — header-based
+        // auth (`http_headers` / `env_http_headers`), token-less local OSS
+        // servers, etc. We can't reliably introspect those, so treat the
+        // provider's declaration of "I don't use OpenAI auth" as sufficient
+        // signal that `/models` is worth attempting; a 401 just falls back
+        // to the bundled catalog.
+        !self.provider_info.requires_openai_auth
     }
 
     async fn uses_codex_backend(&self) -> bool {
@@ -201,6 +224,50 @@ impl RequestTelemetry for ModelsRequestTelemetry {
     }
 }
 
+/// Stable identifier for a `ModelProviderInfo` used to scope the on-disk
+/// models cache. `ModelProviderInfo::name` alone is insufficient because it
+/// is a friendly display label — both the built-in `ollama` and `lmstudio`
+/// providers, for example, share `name = "gpt-oss"` and only differ in
+/// `base_url`. The fingerprint hashes the canonicalized provider config so
+/// any field that could change `/models` semantics (base_url, wire_api,
+/// env_key, auth, aws, http_headers, etc.) produces a distinct cache entry.
+pub(crate) fn provider_config_fingerprint(provider_info: &ModelProviderInfo) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    let canonical = canonical_json(
+        serde_json::to_value(provider_info).unwrap_or(serde_json::Value::Null),
+    );
+    let serialized = serde_json::to_string(&canonical).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    // Prefix with the display name to keep cache files self-documenting in
+    // logs while the hash suffix guarantees uniqueness across configs that
+    // share a name (ollama vs lmstudio, two user-defined providers with the
+    // same friendly label, etc.).
+    format!("{}:{:016x}", provider_info.name, hasher.finish())
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                if let Some(v) = map.get(&key) {
+                    sorted.insert(key, canonical_json(v.clone()));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_json).collect()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -243,5 +310,91 @@ mod tests {
         );
 
         assert!(!endpoint.has_command_auth());
+    }
+
+    #[test]
+    fn provider_with_experimental_bearer_token_reports_self_provided_auth() {
+        let mut info = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+        info.experimental_bearer_token = Some("provider-token".to_string());
+        let endpoint = OpenAiModelsEndpoint::new(info, /*auth_manager*/ None);
+
+        assert!(endpoint.has_self_provided_auth());
+    }
+
+    #[test]
+    fn provider_without_self_provided_auth_reports_none() {
+        // Stock OpenAI provider requires OpenAI auth and has no bearer source.
+        let endpoint = OpenAiModelsEndpoint::new(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            /*auth_manager*/ None,
+        );
+
+        assert!(!endpoint.has_self_provided_auth());
+    }
+
+    #[test]
+    fn non_openai_provider_reports_self_provided_auth_without_explicit_bearer() {
+        // A custom provider (`requires_openai_auth = false`) authenticated via
+        // env_http_headers (or no auth at all for local OSS) qualifies for
+        // /models refresh even with no bearer-token field set.
+        let info = ModelProviderInfo {
+            name: "header-auth-provider".to_string(),
+            base_url: Some("http://localhost:9999/v1".to_string()),
+            env_http_headers: Some(
+                [("X-API-Key".to_string(), "MY_PROVIDER_API_KEY".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            requires_openai_auth: false,
+            ..ModelProviderInfo::default()
+        };
+        let endpoint = OpenAiModelsEndpoint::new(info, /*auth_manager*/ None);
+
+        assert!(endpoint.has_self_provided_auth());
+    }
+
+    #[test]
+    fn provider_id_distinguishes_oss_providers_with_shared_display_name() {
+        // Built-in ollama and lmstudio providers both share name = "gpt-oss"
+        // but differ in base_url. The cache fingerprint must disambiguate
+        // them so switching providers does not reuse the other catalog.
+        let ollama = codex_model_provider_info::create_oss_provider_with_base_url(
+            &format!(
+                "http://localhost:{}/v1",
+                codex_model_provider_info::DEFAULT_OLLAMA_PORT
+            ),
+            codex_model_provider_info::WireApi::Responses,
+        );
+        let lmstudio = codex_model_provider_info::create_oss_provider_with_base_url(
+            &format!(
+                "http://localhost:{}/v1",
+                codex_model_provider_info::DEFAULT_LMSTUDIO_PORT
+            ),
+            codex_model_provider_info::WireApi::Responses,
+        );
+        assert_eq!(ollama.name, lmstudio.name);
+
+        let ollama_endpoint = OpenAiModelsEndpoint::new(ollama, /*auth_manager*/ None);
+        let lmstudio_endpoint = OpenAiModelsEndpoint::new(lmstudio, /*auth_manager*/ None);
+
+        assert_ne!(
+            ollama_endpoint.provider_id(),
+            lmstudio_endpoint.provider_id(),
+            "providers with the same display name must produce distinct cache fingerprints"
+        );
+    }
+
+    #[test]
+    fn provider_id_is_stable_for_equal_configs() {
+        // Two endpoints built from clones of the same provider info must
+        // hash to the same fingerprint so cache reads hit on a re-launch.
+        let info = codex_model_provider_info::create_oss_provider_with_base_url(
+            "http://localhost:11434/v1",
+            codex_model_provider_info::WireApi::Responses,
+        );
+        let a = OpenAiModelsEndpoint::new(info.clone(), /*auth_manager*/ None);
+        let b = OpenAiModelsEndpoint::new(info, /*auth_manager*/ None);
+
+        assert_eq!(a.provider_id(), b.provider_id());
     }
 }

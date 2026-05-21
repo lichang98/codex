@@ -1089,7 +1089,11 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let auth = sess.services.auth_manager.auth().await;
+    // Used only to derive the connector-directory cache key inside
+    // `list_tool_suggest_discoverable_tools_with_auth`; no Codex/ChatGPT
+    // backend request is issued with this token here, so skip the proactive
+    // refresh that would otherwise block this turn on `auth.openai.com`.
+    let auth = sess.services.auth_manager.auth_no_refresh().await;
     let discoverable_tools = if apps_enabled && tool_suggest_enabled(turn_context) {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(

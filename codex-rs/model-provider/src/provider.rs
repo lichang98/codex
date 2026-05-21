@@ -419,6 +419,44 @@ mod tests {
         assert!(provider.auth_manager().is_none());
     }
 
+    #[tokio::test]
+    async fn create_model_provider_drops_base_manager_for_non_openai_provider() {
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "Custom".to_string(),
+                base_url: Some("http://localhost:1234/v1".to_string()),
+                wire_api: WireApi::Responses,
+                requires_openai_auth: false,
+                ..Default::default()
+            },
+            Some(AuthManager::from_auth_for_testing(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            )),
+        );
+
+        assert!(provider.auth_manager().is_none());
+        assert!(provider.auth().await.is_none());
+        assert!(!provider.supports_attestation());
+    }
+
+    #[test]
+    fn create_model_provider_keeps_base_manager_when_requires_openai_auth() {
+        let provider = create_model_provider(
+            ModelProviderInfo {
+                name: "AzureOpenAI".to_string(),
+                base_url: Some("https://example.openai.azure.com/v1".to_string()),
+                wire_api: WireApi::Responses,
+                requires_openai_auth: true,
+                ..Default::default()
+            },
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "openai-api-key",
+            ))),
+        );
+
+        assert!(provider.auth_manager().is_some());
+    }
+
     #[test]
     fn openai_provider_returns_unauthenticated_openai_account_state() {
         let provider = create_model_provider(
@@ -569,6 +607,10 @@ mod tests {
 
         let mut provider_info = provider_for(server.uri());
         provider_info.experimental_bearer_token = Some("provider-token".to_string());
+        // Covers the real custom-provider scenario: requires_openai_auth = false,
+        // a stale managed ChatGPT auth happens to be on disk, and the provider
+        // still refreshes /models via its own bearer token without involving the
+        // managed AuthManager.
         let provider = create_model_provider(
             provider_info,
             Some(AuthManager::from_auth_for_testing(

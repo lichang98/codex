@@ -27,11 +27,17 @@ impl ModelsCacheManager {
         }
     }
 
-    /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist or is stale.
-    pub(crate) async fn load_fresh(&self, expected_version: &str) -> Option<ModelsCache> {
+    /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist, is stale,
+    /// belongs to a different `client_version`, or belongs to a different `provider_id`.
+    pub(crate) async fn load_fresh(
+        &self,
+        expected_version: &str,
+        expected_provider_id: &str,
+    ) -> Option<ModelsCache> {
         info!(
                 cache_path = %self.cache_path.display(),
                 expected_version,
+                expected_provider_id,
             "models cache: attempting load_fresh"
         );
         let cache = match self.load().await {
@@ -44,6 +50,7 @@ impl ModelsCacheManager {
         info!(
             cache_path = %self.cache_path.display(),
             cached_version = ?cache.client_version,
+            cached_provider_id = ?cache.provider_id,
             fetched_at = %cache.fetched_at,
             "models cache: loaded cache file"
         );
@@ -53,6 +60,17 @@ impl ModelsCacheManager {
                 expected_version,
                 cached_version = ?cache.client_version,
                 "models cache: cache version mismatch"
+            );
+            return None;
+        }
+        // Treat a missing `provider_id` (pre-existing caches written before this field existed)
+        // as a mismatch so we don't silently reuse another provider's catalog.
+        if cache.provider_id.as_deref() != Some(expected_provider_id) {
+            info!(
+                cache_path = %self.cache_path.display(),
+                expected_provider_id,
+                cached_provider_id = ?cache.provider_id,
+                "models cache: cache provider mismatch"
             );
             return None;
         }
@@ -79,11 +97,13 @@ impl ModelsCacheManager {
         models: &[ModelInfo],
         etag: Option<String>,
         client_version: String,
+        provider_id: String,
     ) {
         let cache = ModelsCache {
             fetched_at: Utc::now(),
             etag,
             client_version: Some(client_version),
+            provider_id: Some(provider_id),
             models: models.to_vec(),
         };
         if let Err(err) = self.save_internal(&cache).await {
@@ -165,6 +185,12 @@ pub(crate) struct ModelsCache {
     pub(crate) etag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) client_version: Option<String>,
+    /// Provider identity (e.g. `openai`, `ollama`, or a user-defined provider
+    /// name) used to scope the cache. Treat a `None` value (caches written
+    /// before this field existed) as a mismatch in `load_fresh` so we never
+    /// reuse another provider's catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_id: Option<String>,
     pub(crate) models: Vec<ModelInfo>,
 }
 
